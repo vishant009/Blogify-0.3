@@ -52,42 +52,15 @@ router.post("/signup", async (req, res) => {
       });
     }
 
-    const verificationCode = generateCode();
-    const user = await User.create({
+    await User.create({
       fullname,
       email,
       password,
       likedBlogs: [],
       bio: "",
-      verificationCode,
-      verificationCodeExpires: Date.now() + 3600000,
     });
 
-    const verificationUrl = `http://${req.headers.host}/user/verify-email/${user._id}/${verificationCode}`;
-    await sendEmail({
-      to: email,
-      subject: "Verify Your Blogify Account",
-      html: `
-        <h2>Welcome to Blogify!</h2>
-        <p>Please verify your email by entering the following code on the verification page:</p>
-        <h3>${verificationCode}</h3>
-        <p>Or click the link below:</p>
-        <a href="${verificationUrl}">Verify Email</a>
-        <p>This code expires in 1 hour.</p>
-      `,
-    });
-
-    return res.render("signup", {
-      title: "Sign Up",
-      user: req.user || null,
-      success_msg: "Verification code sent to your email",
-      error: null,
-      showVerification: true,
-      email,
-      fullname,
-      userId: user._id,
-      verificationCode,
-    });
+    return res.redirect("/user/signin?success_msg=Account created successfully");
   } catch (error) {
     return res.render("signup", {
       title: "Sign Up",
@@ -97,69 +70,6 @@ router.post("/signup", async (req, res) => {
       showVerification: false,
       email,
       fullname,
-    });
-  }
-});
-
-// GET /user/verify-email/:id/:code
-router.get("/verify-email/:id/:code", async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) throw new Error("User not found");
-    if (user.isVerified) throw new Error("Email already verified");
-    if (user.verificationCode !== req.params.code) throw new Error("Invalid verification code");
-    if (user.verificationCodeExpires < Date.now()) throw new Error("Verification code expired");
-
-    user.isVerified = true;
-    user.verificationCode = undefined;
-    user.verificationCodeExpires = undefined;
-    await user.save();
-
-    return res.redirect("/user/signin?success_msg=Email verified successfully");
-  } catch (error) {
-    return res.render("signup", {
-      title: "Sign Up",
-      user: req.user || null,
-      error: error.message || "Error verifying email",
-      success_msg: null,
-      showVerification: true,
-      email: req.query.email || "",
-      fullname: req.query.fullname || "",
-      userId: req.params.id,
-      verificationCode: req.params.code,
-    });
-  }
-});
-
-// POST /user/verify-email/:id/:code
-router.post("/verify-email/:id/:code", async (req, res) => {
-  const { code } = req.body;
-  const { id } = req.params;
-
-  try {
-    const user = await User.findById(id);
-    if (!user) throw new Error("User not found");
-    if (user.isVerified) throw new Error("Email already verified");
-    if (user.verificationCode !== code) throw new Error("Invalid verification code");
-    if (user.verificationCodeExpires < Date.now()) throw new Error("Verification code expired");
-
-    user.isVerified = true;
-    user.verificationCode = undefined;
-    user.verificationCodeExpires = undefined;
-    await user.save();
-
-    return res.redirect("/user/signin?success_msg=Email verified successfully");
-  } catch (error) {
-    return res.render("signup", {
-      title: "Sign Up",
-      user: req.user || null,
-      error: error.message || "Error verifying email",
-      success_msg: null,
-      showVerification: true,
-      email: req.query.email || "",
-      fullname: req.query.fullname || "",
-      userId: id,
-      verificationCode: code,
     });
   }
 });

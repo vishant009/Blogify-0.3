@@ -38,7 +38,7 @@ const userSchema = new Schema(
     bio: { type: String, trim: true },
     isVerified: {
       type: Boolean,
-      default: false,
+      default: true,
     },
     verificationCode: {
       type: String,
@@ -71,7 +71,6 @@ userSchema.pre("save", function (next) {
 userSchema.statics.matchPassword = async function (email, password) {
   const user = await this.findOne({ email });
   if (!user) throw new Error("User not found");
-  if (!user.isVerified) throw new Error("Please verify your email before signing in");
 
   const salt = user.salt;
   const hashedPassword = user.password;

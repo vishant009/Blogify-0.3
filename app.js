@@ -1,4 +1,4 @@
-// app.js (or server.js - assuming this is the main file from your context)
+// app.js (updated with improved error handling, added required env vars, and minor optimizations)
 require('dotenv').config();
 const express = require("express");
 const http = require('http');
@@ -35,6 +35,9 @@ const PORT = process.env.PORT || 8000;
 const requiredEnvVars = [
   'MONGODB_URI',
   'JWT_SECRET',
+  'CLOUDINARY_CLOUD_NAME',
+  'CLOUDINARY_API_KEY',
+  'CLOUDINARY_API_SECRET',
   'EMAIL_USER',
   'EMAIL_PASS'
 ];
@@ -46,9 +49,12 @@ requiredEnvVars.forEach((varName) => {
 });
 
 // Debug: Log environment variables (mask sensitive info)
-console.log('MONGODB_URI:', process.env.MONGODB_URI);
+console.log('MONGODB_URI:', process.env.MONGODB_URI ? 'Set' : 'Not set');
 console.log('PORT:', PORT);
-console.log('JWT_SECRET:', process.env.JWT_SECRET);
+console.log('JWT_SECRET:', process.env.JWT_SECRET ? 'Set' : 'Not set');
+console.log('CLOUDINARY_CLOUD_NAME:', process.env.CLOUDINARY_CLOUD_NAME ? 'Set' : 'Not set');
+console.log('CLOUDINARY_API_KEY:', process.env.CLOUDINARY_API_KEY ? 'Set' : 'Not set');
+console.log('CLOUDINARY_API_SECRET:', process.env.CLOUDINARY_API_SECRET ? 'Set' : 'Not set');
 console.log('EMAIL_USER:', process.env.EMAIL_USER);
 console.log('EMAIL_PASS:', '****'); // Mask password
 
@@ -72,7 +78,9 @@ io.use((socket, next) => {
         const userPayload = verifyToken(token);
         socket.user = userPayload;
         return next();
-      } catch (err) {}
+      } catch (err) {
+        // Silent fail
+      }
     }
   }
   next(new Error('Authentication error'));
@@ -112,89 +120,94 @@ const renderWithError = (res, view, data, errorMsg) => {
   return res.render(view, { ...data, error_msg: errorMsg, success_msg: null });
 };
 
+// Helper function to fetch blogs with visibility filter and enrich with comments and statuses
+async function fetchEnrichedBlogs(req, blogQuery = {}) {
+  const Blog = require("./models/blog");
+  const Comment = require("./models/comments");
+  const Notification = require("./models/notification");
+  const User = require("./models/user");
+
+  // Fetch all blogs matching query, populate, then filter in JS (consider aggregation for scale)
+  let allBlogs = await Blog.find(blogQuery)
+    .populate("createdBy", "fullname email profileImageURL followers isPrivate")
+    .populate("likes", "fullname profileImageURL")
+    .sort({ createdAt: -1 });
+
+  allBlogs = allBlogs.filter(blog => {
+    const cb = blog.createdBy;
+    if (!req.user) {
+      return !cb.isPrivate;
+    }
+    return !cb.isPrivate ||
+      cb._id.equals(req.user._id) ||
+      (cb.isPrivate && cb.followers?.some(f => f.equals(req.user._id)));
+  });
+
+  const currentUser = req.user ? await User.findById(req.user._id).populate("following", "fullname profileImageURL _id") : null;
+
+  return Promise.all(
+    allBlogs.map(async (blog) => {
+      const comments = await Comment.find({ blogId: blog._id, parent: null })
+        .populate("createdBy", "fullname profileImageURL")
+        .populate("likes", "fullname profileImageURL")
+        .sort({ createdAt: -1 });
+
+      const replyIds = comments.map(c => c._id);
+      const replies = await Comment.find({ parent: { $in: replyIds } })
+        .populate("createdBy", "fullname profileImageURL")
+        .populate("likes", "fullname profileImageURL")
+        .sort({ createdAt: -1 });
+
+      comments.forEach(comment => {
+        comment.replies = replies.filter(r => r.parent.toString() === comment._id.toString());
+      });
+
+      const totalComments = comments.length + replies.length;
+
+      const isFollowing = req.user
+        ? blog.createdBy.followers?.some((follower) => follower.equals(req.user._id)) || false
+        : false;
+      const isOwn = req.user ? blog.createdBy._id.equals(req.user._id) : false;
+      const pendingRequest = req.user
+        ? await Notification.findOne({
+            sender: req.user._id,
+            recipient: blog.createdBy._id,
+            type: "FOLLOW_REQUEST",
+            status: "PENDING",
+          })
+        : null;
+      const followStatus = isOwn ? "own" : isFollowing ? "following" : pendingRequest ? "requested" : "follow";
+
+      let likesWithStatus = blog.likes.map(liker => ({
+        ...liker._doc,
+        followStatus: "follow" // Default
+      }));
+      if (currentUser) {
+        likesWithStatus = await Promise.all(blog.likes.map(async (liker) => {
+          if (liker._id.equals(currentUser._id)) {
+            return { ...liker._doc, followStatus: "own" };
+          }
+          const isFollowingLiker = currentUser.following?.some(f => f._id.equals(liker._id)) || false;
+          const pendingRequestLiker = await Notification.findOne({
+            sender: currentUser._id,
+            recipient: liker._id,
+            type: "FOLLOW_REQUEST",
+            status: "PENDING",
+          });
+          const followStatusLiker = isFollowingLiker ? "following" : pendingRequestLiker ? "requested" : "follow";
+          return { ...liker._doc, followStatus: followStatusLiker };
+        }));
+      }
+
+      return { ...blog._doc, comments, totalComments, isFollowing, isOwn, followStatus, likes: likesWithStatus };
+    })
+  );
+}
+
 // Home Route
 app.get("/", async (req, res) => {
   try {
-    const Blog = require("./models/blog");
-    const Comment = require("./models/comments");
-    const Notification = require("./models/notification");
-    const User = require("./models/user");
-
-    // Fetch all blogs, populate, then filter in JS (fix for invalid query)
-    let allBlogs = await Blog.find({})
-      .populate("createdBy", "fullname email profileImageURL followers isPrivate")
-      .populate("likes", "fullname profileImageURL")
-      .sort({ createdAt: -1 });
-
-    allBlogs = allBlogs.filter(blog => {
-      const cb = blog.createdBy;
-      if (!req.user) {
-        return !cb.isPrivate;
-      }
-      return !cb.isPrivate ||
-        cb._id.equals(req.user._id) ||
-        (cb.isPrivate && cb.followers?.some(f => f.equals(req.user._id)));
-    });
-
-    const currentUser = req.user ? await User.findById(req.user._id).populate("following", "fullname profileImageURL _id") : null; // Populate following for likes status
-
-    const blogsWithComments = await Promise.all(
-      allBlogs.map(async (blog) => {
-        const comments = await Comment.find({ blogId: blog._id, parent: null })
-          .populate("createdBy", "fullname profileImageURL")
-          .populate("likes", "fullname profileImageURL")
-          .sort({ createdAt: -1 });
-
-        const replyIds = comments.map(c => c._id);
-        const replies = await Comment.find({ parent: { $in: replyIds } })
-          .populate("createdBy", "fullname profileImageURL")
-          .populate("likes", "fullname profileImageURL")
-          .sort({ createdAt: -1 });
-
-        comments.forEach(comment => {
-          comment.replies = replies.filter(r => r.parent.toString() === comment._id.toString());
-        });
-
-        const totalComments = comments.length + replies.length;
-
-        const isFollowing = req.user
-          ? blog.createdBy.followers?.some((follower) => follower.equals(req.user._id)) || false
-          : false;
-        const isOwn = req.user ? blog.createdBy._id.equals(req.user._id) : false;
-        const pendingRequest = req.user
-          ? await Notification.findOne({
-              sender: req.user._id,
-              recipient: blog.createdBy._id,
-              type: "FOLLOW_REQUEST",
-              status: "PENDING",
-            })
-          : null;
-        const followStatus = isOwn ? "own" : isFollowing ? "following" : pendingRequest ? "requested" : "follow"; // Added "own" for consistency
-
-        let likesWithStatus = blog.likes.map(liker => ({
-          ...liker._doc,
-          followStatus: isOwn ? "own" : "follow" // Default
-        }));
-        if (currentUser) {
-          likesWithStatus = await Promise.all(blog.likes.map(async (liker) => {
-            if (liker._id.equals(currentUser._id)) {
-              return { ...liker._doc, followStatus: "own" };
-            }
-            const isFollowingLiker = currentUser.following?.some(f => f._id.equals(liker._id)) || false;
-            const pendingRequestLiker = await Notification.findOne({
-              sender: currentUser._id,
-              recipient: liker._id,
-              type: "FOLLOW_REQUEST",
-              status: "PENDING",
-            });
-            const followStatusLiker = isFollowingLiker ? "following" : pendingRequestLiker ? "requested" : "follow";
-            return { ...liker._doc, followStatus: followStatusLiker };
-          }));
-        }
-
-        return { ...blog._doc, comments, totalComments, isFollowing, isOwn, followStatus, likes: likesWithStatus };
-      })
-    );
+    const blogsWithComments = await fetchEnrichedBlogs(req);
 
     res.render("home", {
       user: req.user || null,
@@ -213,12 +226,10 @@ app.get("/search", async (req, res) => {
     const { q } = req.query;
     const queryStr = q ? q.trim() : "";
     let users = [];
-    let blogs = [];
+    let blogsWithComments = [];
 
     if (queryStr) {
       const User = require("./models/user");
-      const Blog = require("./models/blog");
-      const Comment = require("./models/comments");
       const Notification = require("./models/notification");
 
       users = await User.find({
@@ -249,105 +260,26 @@ app.get("/search", async (req, res) => {
         })
       );
 
-      // Fetch matching blogs, populate, then filter visibility
-      let allBlogs = await Blog.find({
+      const blogQuery = {
         $or: [
           { title: { $regex: queryStr, $options: "i" } },
           { body: { $regex: queryStr, $options: "i" } },
         ],
-      })
-        .populate("createdBy", "fullname profileImageURL followers isPrivate")
-        .populate("likes", "fullname profileImageURL")
-        .sort({ createdAt: -1 });
+      };
+      blogsWithComments = await fetchEnrichedBlogs(req, blogQuery);
 
-      allBlogs = allBlogs.filter(blog => {
-        const cb = blog.createdBy;
-        if (!req.user) {
-          return !cb.isPrivate;
-        }
-        return !cb.isPrivate ||
-          cb._id.equals(req.user._id) ||
-          (cb.isPrivate && cb.followers?.some(f => f.equals(req.user._id)));
-      });
-
-      const blogsWithComments = await Promise.all(
-        allBlogs.map(async (blog) => {
-          const comments = await Comment.find({ blogId: blog._id, parent: null })
-            .populate("createdBy", "fullname profileImageURL")
-            .populate("likes", "fullname profileImageURL")
-            .sort({ createdAt: -1 });
-
-          const replyIds = comments.map(c => c._id);
-          const replies = await Comment.find({ parent: { $in: replyIds } })
-            .populate("createdBy", "fullname profileImageURL")
-            .populate("likes", "fullname profileImageURL")
-            .sort({ createdAt: -1 });
-
-          comments.forEach(comment => {
-            comment.replies = replies.filter(r => r.parent.toString() === comment._id.toString());
-          });
-
-          const totalComments = comments.length + replies.length;
-
-          const isFollowing = req.user
-            ? blog.createdBy.followers?.some((follower) => follower.equals(req.user._id)) || false
-            : false;
-          const isOwn = req.user ? blog.createdBy._id.equals(req.user._id) : false;
-          const pendingRequest = req.user
-            ? await Notification.findOne({
-                sender: req.user._id,
-                recipient: blog.createdBy._id,
-                type: "FOLLOW_REQUEST",
-                status: "PENDING",
-              })
-            : null;
-          const followStatus = isOwn ? "own" : isFollowing ? "following" : pendingRequest ? "requested" : "follow";
-
-          let likesWithStatus = blog.likes.map(liker => ({
-            ...liker._doc,
-            followStatus: isOwn ? "own" : "follow" // Default
-          }));
-          if (currentUser) {
-            likesWithStatus = await Promise.all(blog.likes.map(async (liker) => {
-              if (liker._id.equals(currentUser._id)) {
-                return { ...liker._doc, followStatus: "own" };
-              }
-              const isFollowingLiker = currentUser.following?.some(f => f._id.equals(liker._id)) || false;
-              const pendingRequestLiker = await Notification.findOne({
-                sender: currentUser._id,
-                recipient: liker._id,
-                type: "FOLLOW_REQUEST",
-                status: "PENDING",
-              });
-              const followStatusLiker = isFollowingLiker ? "following" : pendingRequestLiker ? "requested" : "follow";
-              return { ...liker._doc, followStatus: followStatusLiker };
-            }));
-          }
-
-          return { ...blog._doc, comments, totalComments, isFollowing, isOwn, followStatus, likes: likesWithStatus };
-        })
-      );
-
-      res.render("search", {
-        user: req.user || null,
-        currentUser: req.user || null,
-        users: usersWithStatus,
-        blogs: blogsWithComments,
-        query: queryStr,
-        success_msg: req.query.success_msg || null,
-        error_msg: req.query.error_msg || null,
-      });
-    } else {
-      res.render("search", {
-        user: req.user || null,
-        currentUser: req.user || null,
-        users: [],
-        blogs: [],
-        query: queryStr,
-        success_msg: req.query.success_msg || null,
-        error_msg: req.query.error_msg || null,
-      });
+      users = usersWithStatus;
     }
+
+    res.render("search", {
+      user: req.user || null,
+      currentUser: req.user || null,
+      users,
+      blogs: blogsWithComments,
+      query: queryStr,
+      success_msg: req.query.success_msg || null,
+      error_msg: req.query.error_msg || null,
+    });
   } catch (err) {
     console.error("Error in search:", err);
     renderWithError(res, "search", { user: req.user || null, currentUser: req.user || null, users: [], blogs: [], query: "" }, "Failed to load search results");
